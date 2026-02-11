@@ -62,9 +62,11 @@
     <div id="status">Tap to enable camera (iPhone: Safari-ban)</div>
   </div>
 
-  <div id="wrap">
-    <textarea id="machineLog" spellcheck="false"></textarea>
-  </div>
+ <div id="wrap">
+  <div id="canvasHolder"></div>
+  <textarea id="machineLog" spellcheck="false"></textarea>
+</div>
+
 
 <script>
 /* ================== Mobil-first layout ================== */
@@ -292,7 +294,8 @@ function addButtons() {
 function setup() {
   computeLayout();
   const c = createCanvas(CANVAS_W, CANVAS_H);
-  c.parent('wrap');
+  c.parent('canvasHolder');
+
   pixelDensity(1);
   textFont('monospace');
 
@@ -1105,7 +1108,8 @@ function keyPressed() {
 function startRecording() {
   if (rec.active) return;
 
-  const canvasEl = document.querySelector('#wrap canvas');
+  const canvasEl = document.querySelector('#canvasHolder canvas');
+
   if (!canvasEl) return;
 
   const fps = 30;
