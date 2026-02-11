@@ -70,7 +70,8 @@
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
   // p5 MediaElement létrehozása streamből
-  const v = createVideo();
+  const v = createVideo([]);
+
   v.elt.srcObject = stream;
 
   // iOS inline videó trükkök
@@ -79,7 +80,7 @@
   v.elt.muted = true;
   v.elt.autoplay = true;
 
-  await v.elt.play();
+  
 
   v.size(camW, camH);
   v.hide();
@@ -97,8 +98,12 @@ const camW = 640, camH = 480;
 // luminancia mező
 const gridCols = 72, gridRows = 54;
 
+
 /* ================== ÁLLAPOT: kamera ================== */
 let cam, offG;
+let camStarted = false;
+let camInit = null;   // <- egyszer indítjuk
+
 
 /* ================== VIDEO REC (R: start/stop) ================== */
 let rec = {
@@ -193,17 +198,9 @@ function setup() {
   offG = createGraphics(camW, camH);
   offG.pixelDensity(1);
 
-// iPhone kamera indítás (hátsóval próbálkozik)
-startIPhoneCamera({ useBackCamera: true })
-  .then(res => {
-    if (!res) return;
-    cam = res.p5video;
-    // ha később le akarod állítani: res.stream.getTracks().forEach(t => t.stop());
-  })
-  .catch(err => {
-    console.error(err);
-    alert("Kamera hiba / engedély megtagadva. iOS-en ellenőrizd: HTTPS + Safari engedélyek.");
-  });
+// iPhone-on indítást tap-ra tesszük (különben Safari sokszor blokkolja)
+camInit = null;
+
 
 
   // COCO-SSD
@@ -247,13 +244,16 @@ startIPhoneCamera({ useBackCamera: true })
 
 /* ================== DRAW ================== */
 function draw() {
-  if (!cam) {
+ if (!cam || !cam.elt || cam.elt.readyState < 2) {
   background(10);
   fill(255);
-  textSize(14);
-  text("Kamera inicializálás… (engedélyezd a kamerát)", 20, 30);
+  textSize(16);
+  text("Tap to enable camera", 20, 40);
+  textSize(12);
+  text("iPhone: Safari-ban nyisd meg, és engedélyezd a kamerát.", 20, 62);
   return;
 }
+
 
   background(10);
   fpsSmoothed = lerp(fpsSmoothed, frameRate(), 0.12);
@@ -1110,7 +1110,6 @@ function drawImageCover(img, x, y, w, h) {
   image(img, x, y, w, h, sx, sy, sw, sh);
 }
 
-/* ================== Mentés ================== */
 function keyPressed() {
   if (key === 's' || key === 'S') saveCanvas('quadtych_' + Date.now(), 'png');
   if (key === '1') { const img = get(0, 0, P, P); img.save('panel1_' + Date.now(), 'png'); }
@@ -1120,8 +1119,38 @@ function keyPressed() {
     if (!rec.active) startRecording();
     else stopRecording();
   }
-
 }
+
+// --- EZEK IDE JÖNNEK, KÍVÜLRE ---
+
+async function ensureCameraStarted() {
+  if (camInit) return camInit;
+  camInit = startIPhoneCamera({ useBackCamera: true })
+    .then(res => {
+      if (!res) return null;
+      cam = res.p5video;
+      return cam.elt.play().catch(() => {});
+    })
+    .catch(err => {
+      console.error(err);
+      alert("Kamera hiba / engedély megtagadva. iOS-en: Safari + HTTPS + engedélyek.");
+      camInit = null;
+      return null;
+    });
+  return camInit;
+}
+
+function touchStarted() {
+  camStarted = true;
+  ensureCameraStarted();
+  return false;
+}
+
+function mousePressed() {
+  camStarted = true;
+  ensureCameraStarted();
+}
+
 
 </script>
 </body>
