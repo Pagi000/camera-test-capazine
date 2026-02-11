@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI + CV quadtych — COCO-SSD + OpenCV + reality-correction line-memory + copyable machine text</title>
+
+  <!-- p5 -->
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+
+  <!-- ml5 (tartalmaz kompatibilis TFJS-t; ne tölts be külön TFJS 4.x-et) -->
+  <script src="https://cdn.jsdelivr.net/npm/ml5@0.12.2/dist/ml5.min.js"></script>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
+
+  <style>
+    html, body { margin:0; padding:0; background:#0b0b0b; color:#ddd; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; }
+    #hint { padding:10px 12px; font-size:14px; line-height:1.35; opacity:0.92; }
+    code { background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 6px; }
+    #wrap { width:1920px; margin:0 auto; position:relative; }
+
+    canvas { display:block; }
+
+    /* Panel4: copyable */
+    #machineLog{
+      position:absolute;
+      left:960px; top:960px;
+      width:960px; height:960px;
+      box-sizing:border-box;
+      padding:16px 16px;
+      border:0; outline:none; resize:none;
+      background:#070707; color:#d8d8d8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size:12px; line-height:1.35;
+      white-space:pre; overflow:auto;
+      caret-color:transparent;
+      opacity:0.98;
+    }
+    #machineLog::selection { background: rgba(255,255,255,0.18); }
+  </style>
+</head>
+
+<body>
+  <div id="hint">
+  </div>
+
+  <div id="wrap">
+    <textarea id="machineLog" spellcheck="false"></textarea>
+  </div>
+
+<script>
+
+  async function startIPhoneCamera({ useBackCamera = true } = {}) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    alert("Nincs getUserMedia támogatás ebben a böngészőben.");
+    return null;
+  }
+
+  // iOS/Safari: environment = hátsó kamera, user = szelfi
+  const constraints = {
+    audio: false,
+    video: {
+      width: { ideal: camW },
+      height: { ideal: camH },
+      facingMode: useBackCamera ? { ideal: "environment" } : "user"
+    }
+  };
+
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+  // p5 MediaElement létrehozása streamből
+  const v = createVideo();
+  v.elt.srcObject = stream;
+
+  // iOS inline videó trükkök
+  v.elt.setAttribute("playsinline", "");
+  v.elt.setAttribute("webkit-playsinline", "");
+  v.elt.muted = true;
+  v.elt.autoplay = true;
+
+  await v.elt.play();
+
+  v.size(camW, camH);
+  v.hide();
+
+  return { p5video: v, stream };
+}
+
+/* ================== KONFIG ================== */
+const P = 960;
+const CANVAS_W = 1920;
+const CANVAS_H = 1920;
+
+const camW = 640, camH = 480;
+
+// luminancia mező
+const gridCols = 72, gridRows = 54;
+
+/* ================== ÁLLAPOT: kamera ================== */
+let cam, offG;
+
+/* ================== VIDEO REC (R: start/stop) ================== */
+let rec = {
+  active: false,
+  recorder: null,
+  chunks: [],
+  stream: null,
+  startedAt: 0
+};
+
+
+/* ================== AI: COCO-SSD ================== */
+let detector = null;
+let detectorReady = false;
+let detections = [];
+let lastDetectAt = 0;
+const detectIntervalMs = 260;
+
+/* ================== CV: OpenCV ================== */
+let cvReady = false;
+let orb = null;
+let keypoints = [];
+let edgePts = [];
+let edgeDensity = 0;
+
+/* ================== “mérés”: luminancia mező ================== */
+let lumField = [];
+let lumFieldSm = [];
+let avgBrightness = 0;
+
+/* ================== PANEL 2: AI “reality-correction” luminance + line-memory ==================
+   Vizuálisan csak Panel2 változik:
+   - Panel2 nem a nyers lumFieldSm-ből, hanem egy "optimalizált" lumOptSm mezőből számol gradienst.
+   - Kontúrkövetés: a triptichon-szerű, simább trace (nincs szög-kvantálás / "corner push").
+*/
+let lineMemG = null;
+
+// triptichon-szerű paraméterek
+const P2_FADE = 14;
+const P2_STROKES_PER_FRAME = 260;
+const P2_STEPS_MIN = 14;
+const P2_STEPS_MAX = 46;
+const P2_STEP_SIZE = 3.20;
+const P2_BREAK_PROB = 0.18;
+const P2_BASE_W = 0.55;
+
+// "optimális" luminance mező (AI-szerű korrekció)
+let lumOpt = [];
+let lumOptSm = [];
+let targetLum = 0.62; // 0..1 “ideális” átlagfény
+
+/* ================== PANEL 3: particle dataflow (finomabb, kontrasztosabb) ================== */
+let particles = [];
+const MAX_PARTICLES = 2200;
+
+class Particle {
+  constructor(x, y, vx, vy, life, w0) {
+    this.x = x; this.y = y;
+    this.vx = vx; this.vy = vy;
+    this.life = life;
+    this.age = 0;
+    this.px = x; this.py = y;
+    this.w0 = w0;            // alapsúly / “méret”
+  }
+  step(flowFx, flowFy) {
+    this.px = this.x; this.py = this.y;
+    this.vx = this.vx * 0.92 + flowFx * 0.55;
+    this.vy = this.vy * 0.92 + flowFy * 0.55;
+    this.x += this.vx;
+    this.y += this.vy;
+    this.age++;
+    return (this.age < this.life);
+  }
+}
+
+/* ================== PANEL 4: copyable log ================== */
+const logEl = document.getElementById('machineLog');
+let logLines = [];
+const LOG_MAX = 240;
+let lastLogAt = 0;
+const logIntervalMs = 220;
+
+let fpsSmoothed = 0;
+
+/* ================== SETUP ================== */
+function setup() {
+  const c = createCanvas(CANVAS_W, CANVAS_H);
+  c.parent('wrap');
+  pixelDensity(1);
+  textFont('monospace');
+
+  offG = createGraphics(camW, camH);
+  offG.pixelDensity(1);
+
+// iPhone kamera indítás (hátsóval próbálkozik)
+startIPhoneCamera({ useBackCamera: true })
+  .then(res => {
+    if (!res) return;
+    cam = res.p5video;
+    // ha később le akarod állítani: res.stream.getTracks().forEach(t => t.stop());
+  })
+  .catch(err => {
+    console.error(err);
+    alert("Kamera hiba / engedély megtagadva. iOS-en ellenőrizd: HTTPS + Safari engedélyek.");
+  });
+
+
+  // COCO-SSD
+  detector = ml5.objectDetector('cocossd', { flipHorizontal: true }, () => {
+    detectorReady = true;
+    console.log("COCO-SSD ready");
+  });
+
+  // OpenCV init
+  const waitCV = setInterval(() => {
+    if (window.cv && cv.Mat) {
+      clearInterval(waitCV);
+      cvReady = true;
+      try { orb = new cv.ORB(); }
+      catch (e) { try { orb = cv.ORB_create(); } catch(e2) { orb = null; } }
+      console.log("OpenCV ready. ORB:", !!orb);
+    }
+  }, 60);
+
+  // lum mezők init
+  for (let r = 0; r < gridRows; r++) {
+    lumField[r] = new Array(gridCols).fill(0);
+    lumFieldSm[r] = new Array(gridCols).fill(0);
+
+    // Panel2-hez: “optimalizált” mezők
+    lumOpt[r] = new Array(gridCols).fill(0);
+    lumOptSm[r] = new Array(gridCols).fill(0);
+  }
+
+  // panel2 memória
+  lineMemG = createGraphics(P, P);
+  lineMemG.pixelDensity(1);
+  lineMemG.background(248);
+  lineMemG.stroke(0);
+  lineMemG.noFill();
+
+  // panel4 log init
+  logEl.value = `MACHINE STREAM (copyable)\npanel4 := derived from the same camera frame as panels 1–3\n---------------------------------------------------------\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ================== DRAW ================== */
+function draw() {
+  if (!cam) {
+  background(10);
+  fill(255);
+  textSize(14);
+  text("Kamera inicializálás… (engedélyezd a kamerát)", 20, 30);
+  return;
+}
+
+  background(10);
+  fpsSmoothed = lerp(fpsSmoothed, frameRate(), 0.12);
+
+  // camera -> offscreen + flip
+  offG.push();
+  offG.translate(camW, 0);
+  offG.scale(-1, 1);
+  offG.image(cam, 0, 0, camW, camH);
+  offG.pop();
+
+  computeBrightnessAndField(offG);
+
+  // >>> Panel2 újdonság: “AI luminance correction” mező
+  computeOptimalLuminanceField();
+
+  if (cvReady) {
+    try { runOpenCV(offG); } catch(e) {}
+  }
+
+  // COCO detect
+  const now = millis();
+  if (detectorReady && now - lastDetectAt > detectIntervalMs) {
+    lastDetectAt = now;
+    detector.detect(offG.elt, (err, results) => {
+      if (!err && results) detections = results;
+    });
+  }
+
+  // panels
+  drawPanel1(0, 0, P, P);
+  drawPanel2(P, 0, P, P);     // <<< vizuálisan ez változik
+  drawPanel3(0, P, P, P);
+  drawPanel4BG(P, P, P, P);
+  drawPanel4TextToCanvas(P, P, P, P);
+
+  // separators
+  stroke(40); strokeWeight(2);
+  line(P, 0, P, P);
+  line(0, P, CANVAS_W, P);
+  line(P, P, P, CANVAS_H);
+
+  // machine log update
+  if (now - lastLogAt > logIntervalMs) {
+    lastLogAt = now;
+    appendMachineLogLine();
+    flushMachineLog();
+  }
+}
+
+/* ================== PANEL 1: camera + overlay ================== */
+function drawPanel1(x, y, w, h) {
+  noStroke(); fill(0); rect(x, y, w, h);
+
+  drawImageCover(offG, x, y, w, h);
+
+  // scan/grid + vignette (maradhat)
+  drawScanOverlay(x, y, w, h);
+
+  // keypoints (kicsit diszkrétebb, hogy a COCO fehér legyen)
+  drawKeypointsOverlaySoft(x, y, w, h);
+
+  // edges: PONTOK KÉK (0,0,250)
+  drawEdgesDotsBlue(x, y, w, h);
+
+  // COCO overlay: FEHÉR körvonal (bbox + crosshair + bar + label) — változatlan
+  drawDetectionsOverlayWhite(x, y, w, h);
+
+  // info bar
+  noStroke();
+  fill(0, 190);
+  rect(x + 14, y + h - 96, w - 28, 78, 12);
+  fill(245);
+  textSize(12);
+
+  const sum = summarizeDetections(detections, 4);
+  const cvS = cvReady ? "CV:OK" : "CV:WAIT";
+  const aiS = detectorReady ? "AI:OK" : "AI:WAIT";
+  text(`${aiS} ${cvS}  COCO: ${sum || "—"}`, x + 26, y + h - 66);
+  text(`lumμ=${avgBrightness.toFixed(3)}  edgeρ=${edgeDensity.toFixed(3)}  kp=${keypoints.length}  obj=${detections.length}  FPS~${fpsSmoothed.toFixed(1)}`, x + 26, y + h - 44);
+}
+
+/* ================== PANEL 2: AI reality-correction → line-memory (SIMÁBB STÍLUS) ================== */
+function drawPanel2(x, y, w, h) {
+  noStroke(); fill(248);
+  rect(x, y, w, h);
+
+  updateLineMemoryPanel2();
+
+  push();
+  translate(x, y);
+  image(lineMemG, 0, 0, w, h);
+
+  // diszkrét frame
+  noFill(); stroke(0, 150); strokeWeight(1);
+  rect(14, 14, w - 28, h - 28);
+
+  noStroke();
+  fill(0, 130);
+  textSize(12);
+  text(`reality-correction: (edges/keypoints/objects) → optimal-luminance trace`, 22, 34);
+  pop();
+}
+
+/* ================== PANEL 3: particle dataflow (változatlan) ================== */
+function drawPanel3(x, y, w, h) {
+  noStroke(); fill(0);
+  rect(x, y, w, h);
+
+  push();
+  translate(x, y);
+
+  // finomabb grid (kevésbé intenzív)
+  drawSoftGrid(w, h);
+
+  seedParticles(w, h);
+
+  let alive = [];
+  const N = particles.length;
+
+  // binning a kapcsolatokhoz
+  const cell = 26; // ritkább háló
+  const cols = ceil(w / cell), rows = ceil(h / cell);
+  const bins = new Array(cols * rows);
+  for (let i = 0; i < bins.length; i++) bins[i] = [];
+
+  // trail
+  for (let i = 0; i < N; i++) {
+    const p = particles[i];
+
+    const camX = map(p.x, 0, w, 0, camW);
+    const camY = map(p.y, 0, h, 0, camH);
+    const b = sampleFieldAtSm(camX, camY);
+
+    const n = noise(p.x * 0.0017, p.y * 0.0017, frameCount * 0.0022);
+    const ang = n * TWO_PI * 2.0;
+
+    // sötét részeken erősebb, de overall csökkentett
+    const strength = map(1 - b, 0, 1, 0.03, 0.42);
+
+    const fx = cos(ang) * strength;
+    const fy = sin(ang) * strength;
+
+    const ok = p.step(fx, fy);
+
+    // wrap
+    if (p.x < 0) p.x += w; if (p.x > w) p.x -= w;
+    if (p.y < 0) p.y += h; if (p.y > h) p.y -= h;
+
+    if (ok) {
+      // méret/kontraszt adatfüggően
+      const a = map(p.age, 0, p.life, 110, 8);
+      const sw = 0.65 + p.w0 * 1.25;
+      strokeWeight(sw);
+
+      // nagyobb kontraszt: világosabb vonal
+      stroke(255, a);
+      line(p.px, p.py, p.x, p.y);
+
+      // bin
+      const cx = constrain(floor(p.x / cell), 0, cols - 1);
+      const cy = constrain(floor(p.y / cell), 0, rows - 1);
+      bins[cy * cols + cx].push(p);
+
+      alive.push(p);
+    }
+  }
+  particles = alive;
+
+  // kapcsolatok: kevesebb, de kontrasztosabb + adatfüggő távolság
+  for (let by = 0; by < rows; by++) {
+    for (let bx = 0; bx < cols; bx++) {
+      const bin = bins[by * cols + bx];
+      if (bin.length < 2) continue;
+
+      const lim = min(bin.length, 16);
+      for (let i = 0; i < lim; i++) {
+        const a = bin[i];
+        for (let j = i + 1; j < lim; j++) {
+          const b = bin[j];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const d2 = dx*dx + dy*dy;
+
+          // adatfüggő link radius (sötét → több kötés)
+          const camX = map((a.x+b.x)*0.5, 0, w, 0, camW);
+          const camY = map((a.y+b.y)*0.5, 0, h, 0, camH);
+          const lum = sampleFieldAtSm(camX, camY);
+          const R = lerp(26, 54, 1 - lum);
+          const R2 = R*R;
+
+          if (d2 < R2 && random() < 0.36) {
+            const alpha = map(d2, 0, R2, 110, 0);
+            stroke(255, alpha);
+            strokeWeight(0.75 + 0.6 * (a.w0 + b.w0) * 0.5);
+            line(a.x, a.y, b.x, b.y);
+          }
+        }
+      }
+    }
+  }
+
+  // státusz
+  noStroke();
+  fill(255, 140);
+  textSize(12);
+  const okCV = cvReady ? "OK" : "WAIT";
+  const okAI = detectorReady ? "OK" : "WAIT";
+  text(`AI:${okAI} CV:${okCV}  obj:${detections.length}  kp:${keypoints.length}  edgeρ:${edgeDensity.toFixed(3)}  particles:${particles.length}`, 16, 24);
+
+  pop();
+}
+
+/* ================== PANEL 4 BG (textarea a szöveg) ================== */
+function drawPanel4BG(x, y, w, h) {
+  noStroke(); fill(7); rect(x, y, w, h);
+  push();
+  translate(x, y);
+  noFill(); stroke(255, 18); strokeWeight(1);
+  rect(10, 10, w - 20, h - 20);
+  noStroke(); fill(255, 70);
+  textSize(12);
+  text(`machine-log (copyable textarea)`, 16, 26);
+  pop();
+}
+
+function drawPanel4TextToCanvas(x, y, w, h) {
+  push();
+  translate(x, y);
+
+  // belső margó a panelen belül
+  const pad = 18;
+  const innerW = w - pad*2;
+  const innerH = h - pad*2;
+
+  // ugyanaz a header, mint a textarea-ban
+  const header =
+`MACHINE STREAM / COPYABLE
+panel4 := feature-tokens derived from the same camera frame as panels 1–3
+---------------------------------------------------------------`;
+
+  const lines = header.split("\n").concat(logLines);
+
+  // szöveg stílus (konzisztensek a textarea-val)
+  textFont('monospace');
+  textSize(12);
+  noStroke();
+  fill(216); // #d8d8d8-szerű
+
+  // sorok renderelése, vágással (hogy ne fusson ki)
+  const lineH = 12 * 1.35;
+  const maxLines = floor(innerH / lineH);
+
+  const start = max(0, lines.length - maxLines);
+
+  let yy = pad + 4;
+  for (let i = start; i < lines.length; i++) {
+    const s = lines[i];
+
+    // egyszerű “clip”: túl hosszú sorokat levágunk
+    let out = s;
+    while (textWidth(out) > innerW && out.length > 4) {
+      out = out.slice(0, -4) + "…";
+    }
+
+    text(out, pad, yy);
+    yy += lineH;
+    if (yy > pad + innerH) break;
+  }
+
+  pop();
+}
+
+
+/* ================== PANEL 2 motor ================== */
+function updateLineMemoryPanel2() {
+  if (!lineMemG) return;
+
+  if (P2_FADE > 0) {
+    lineMemG.noStroke();
+    lineMemG.fill(248, P2_FADE);
+    lineMemG.rect(0, 0, P, P);
+  }
+
+  for (let s = 0; s < P2_STROKES_PER_FRAME; s++) {
+    const seed = pickSeedForPanel2();
+    if (!seed) continue;
+    // SIMA (triptichon-szerű) kontúrkövetés:
+    traceContourLogic(seed.x, seed.y, seed.bias);
+  }
+}
+
+function pickSeedForPanel2() {
+  // preferencia: edge > keypoint > object
+  if (edgePts && edgePts.length > 0 && random() < 0.64) {
+    const p = edgePts[floor(random(edgePts.length))];
+    return { x: map(p.x, 0, camW, 0, P), y: map(p.y, 0, camH, 0, P), bias: 1.0 };
+  }
+  if (keypoints && keypoints.length > 0 && random() < 0.82) {
+    const k = keypoints[floor(random(keypoints.length))];
+    return { x: map(k.x, 0, camW, 0, P), y: map(k.y, 0, camH, 0, P), bias: 0.85 };
+  }
+  if (detections && detections.length > 0) {
+    const d = detections[floor(random(detections.length))];
+    const cx = d.x + d.width * 0.5;
+    const cy = d.y + d.height * 0.5;
+    const conf = constrain(d.confidence ?? d.score ?? 0.6, 0, 1);
+    return { x: map(cx, 0, camW, 0, P), y: map(cy, 0, camH, 0, P), bias: 0.65 + conf*0.55 };
+  }
+  return null;
+}
+
+/* ===== Panel2: gradiens az “optimalizált” luminance mezőből ===== */
+function sampleOptAtSm(camX, camY) {
+  return sampleFieldGeneric(lumOptSm, camX, camY);
+}
+
+function gradAtPanel(px, py) {
+  // panel -> camera
+  let cx = map(px, 0, P, 0, camW - 1);
+  let cy = map(py, 0, P, 0, camH - 1);
+  cx = constrain(cx, 0, camW - 1);
+  cy = constrain(cy, 0, camH - 1);
+
+  const eps = 6;
+  const l = sampleOptAtSm(cx - eps, cy);
+  const r = sampleOptAtSm(cx + eps, cy);
+  const u = sampleOptAtSm(cx, cy - eps);
+  const d = sampleOptAtSm(cx, cy + eps);
+
+  return { gx: (r - l), gy: (d - u), lum: sampleOptAtSm(cx, cy) };
+}
+
+/* ===== Panel2: SIMÁBB kontúrkövetés (triptichon jelleg) ===== */
+function traceContourLogic(x0, y0, bias = 1.0) {
+  let x = constrain(x0, 2, P - 3);
+  let y = constrain(y0, 2, P - 3);
+
+  const g0 = gradAtPanel(x, y);
+  const gm = Math.hypot(g0.gx, g0.gy);
+  if (gm < 0.004) return;
+
+  const strength = constrain(gm * 60 * bias, 0, 1);
+  const steps = floor(lerp(P2_STEPS_MIN, P2_STEPS_MAX, strength));
+
+  const w = P2_BASE_W + strength * 0.25;
+  const a = lerp(18, 85, strength);
+  lineMemG.stroke(0, a);
+  lineMemG.strokeWeight(w);
+
+  // kontúr tangens (gradiensre merőleges)
+  let tx = -g0.gy;
+  let ty =  g0.gx;
+  let tlen = Math.hypot(tx, ty) || 1;
+  tx /= tlen; ty /= tlen;
+  if (random() < 0.5) { tx *= -1; ty *= -1; }
+
+  let px = x, py = y;
+
+  for (let i = 0; i < steps; i++) {
+    const breakHere = (random() < (P2_BREAK_PROB + (1 - strength) * 0.12));
+    if (!breakHere) lineMemG.line(px, py, x, y);
+
+    const g = gradAtPanel(x, y);
+    const mag = Math.hypot(g.gx, g.gy);
+    if (mag < 0.003) break;
+
+    let ntx = -g.gy;
+    let nty =  g.gx;
+    let nlen = Math.hypot(ntx, nty) || 1;
+    ntx /= nlen; nty /= nlen;
+
+    // simítás
+    tx = tx * 0.78 + ntx * 0.22;
+    ty = ty * 0.78 + nty * 0.22;
+    const tl = Math.hypot(tx, ty) || 1;
+    tx /= tl; ty /= tl;
+
+    const step = P2_STEP_SIZE * lerp(1.15, 0.85, strength);
+
+    px = x; py = y;
+    x += tx * step;
+    y += ty * step;
+
+    if (x < 2 || x > P - 3 || y < 2 || y > P - 3) break;
+  }
+}
+
+/* ================== LUMINANCIA MEZŐ ================== */
+function computeBrightnessAndField(gfx) {
+  gfx.loadPixels();
+  let sum = 0;
+
+  for (let r = 0; r < gridRows; r++) {
+    for (let c = 0; c < gridCols; c++) {
+      const cx = floor((c + 0.5) * camW / gridCols);
+      const cy = floor((r + 0.5) * camH / gridRows);
+
+      let local = 0, cnt = 0;
+      for (let oy = -2; oy <= 2; oy += 2) {
+        for (let ox = -2; ox <= 2; ox += 2) {
+          const x = constrain(cx + ox, 0, camW - 1);
+          const y = constrain(cy + oy, 0, camH - 1);
+          const idx = 4 * (y * camW + x);
+          const R = gfx.pixels[idx], G = gfx.pixels[idx+1], B = gfx.pixels[idx+2];
+          const L = (0.2126*R + 0.7152*G + 0.0722*B) / 255;
+          local += L; cnt++;
+        }
+      }
+      local /= max(1, cnt);
+      lumField[r][c] = local;
+      lumFieldSm[r][c] = lerp(lumFieldSm[r][c], local, 0.22);
+      sum += local;
+    }
+  }
+  avgBrightness = sum / (gridCols * gridRows);
+}
+
+/* ================== Panel2: “AI” optimal luminance mező ================== */
+function computeOptimalLuminanceField() {
+  // Globális korrekció: mennyire tér el az átlagfény a targettől
+  const globalErr = (targetLum - avgBrightness); // + => világosítani
+  const gain = constrain(0.75 + Math.abs(globalErr) * 1.2, 0.75, 1.35);
+
+  // “AI bias”: ha vannak objektumok, picit erősebb lokális kontraszt
+  const hasObj = (detections && detections.length > 0);
+  const objBoost = hasObj ? 0.08 : 0.0;
+
+  for (let r = 0; r < gridRows; r++) {
+    for (let c = 0; c < gridCols; c++) {
+      const L = lumFieldSm[r][c];
+
+      // középtónus “optimalizálás” (gamma-szerű)
+      let corrected = pow(L, 0.85) * gain + globalErr * 0.55;
+
+      // lokális kontraszt (a struktúra/élek erősítésére)
+      const l = lumFieldSm[r][max(0, c-1)];
+      const rr = lumFieldSm[r][min(gridCols-1, c+1)];
+      const u = lumFieldSm[max(0, r-1)][c];
+      const d = lumFieldSm[min(gridRows-1, r+1)][c];
+      const localEdge = Math.abs(rr - l) + Math.abs(d - u);
+
+      corrected += localEdge * (0.22 + objBoost);
+
+      corrected = constrain(corrected, 0, 1);
+
+      lumOpt[r][c] = corrected;
+      lumOptSm[r][c] = lerp(lumOptSm[r][c], corrected, 0.18);
+    }
+  }
+}
+
+/* ===== mintavétel (változatlan általános sampler) ===== */
+function sampleFieldAtSm(camX, camY) {
+  return sampleFieldGeneric(lumFieldSm, camX, camY);
+}
+function sampleFieldGeneric(field, camX, camY) {
+  if (!field || field.length === 0) return 0.0;
+  camX = constrain(camX, 0, camW - 1);
+  camY = constrain(camY, 0, camH - 1);
+
+  const fx = (camX / (camW - 1)) * (gridCols - 1);
+  const fy = (camY / (camH - 1)) * (gridRows - 1);
+
+  const x0 = constrain(floor(fx), 0, gridCols - 1);
+  const y0 = constrain(floor(fy), 0, gridRows - 1);
+  const x1 = min(x0 + 1, gridCols - 1);
+  const y1 = min(y0 + 1, gridRows - 1);
+
+  const tx = fx - x0;
+  const ty = fy - y0;
+
+  const a = field[y0][x0];
+  const b = field[y0][x1];
+  const c = field[y1][x0];
+  const d = field[y1][x1];
+
+  return lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+}
+
+/* ================== OpenCV ================== */
+function runOpenCV(gfx) {
+  const src = cv.imread(gfx.elt);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  const edges = new cv.Mat();
+  cv.Canny(gray, edges, 50, 140);
+
+  // edge pts + density
+  edgePts = [];
+  const stride = 4;
+  let edgeCount = 0;
+  const total = (camW/stride)*(camH/stride);
+
+  for (let y = 0; y < edges.rows; y += stride) {
+    for (let x = 0; x < edges.cols; x += stride) {
+      const v = edges.ucharPtr(y, x)[0];
+      if (v > 0) { edgePts.push({ x, y }); edgeCount++; }
+    }
+  }
+  edgeDensity = constrain(edgeCount / max(1,total), 0, 1);
+
+  // ORB
+  keypoints = [];
+  if (orb) {
+    const kp = new cv.KeyPointVector();
+    const desc = new cv.Mat();
+    try {
+      orb.detect(gray, kp);
+      orb.compute(gray, kp, desc);
+      const count = kp.size();
+      const lim = Math.min(count, 520);
+      for (let i = 0; i < lim; i++) {
+        const k = kp.get(i);
+        keypoints.push({ x: k.pt.x, y: k.pt.y, response: k.response });
+      }
+    } catch (e) {}
+    kp.delete(); desc.delete();
+  }
+
+  src.delete(); gray.delete(); edges.delete();
+}
+
+/* ================== Panel1 overlay pieces ================== */
+function drawScanOverlay(x,y,w,h){
+  
+
+  // scanlines
+  stroke(255, 14);
+  strokeWeight(1);
+  for (let yy=y; yy<y+h; yy+=6) line(x, yy, x+w, yy);
+
+  // luminance grid tint
+  const cellW = w/gridCols, cellH = h/gridRows;
+  noStroke();
+  for (let r=0;r<gridRows;r++){
+    for (let c=0;c<gridCols;c++){
+      const b = lumFieldSm[r][c];
+      const a = map(1-b, 0, 1, 0, 110);
+      fill(0, a);
+      rect(x+c*cellW, y+r*cellH, cellW, cellH);
+    }
+  }
+}
+
+function startRecording() {
+  if (rec.active) return;
+
+  // p5 canvas DOM elem
+  const canvasEl = document.querySelector('#wrap canvas');
+  if (!canvasEl) {
+    console.warn("No canvas element found for recording.");
+    return;
+  }
+
+  // 30 FPS stream
+  const fps = 30;
+  rec.stream = canvasEl.captureStream(fps);
+
+  // mimeType választás (böngésző-függő)
+  let options = {};
+  const preferred = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ];
+  for (const mt of preferred) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(mt)) {
+      options.mimeType = mt;
+      break;
+    }
+  }
+
+  rec.chunks = [];
+  rec.recorder = new MediaRecorder(rec.stream, options);
+
+  rec.recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) rec.chunks.push(e.data);
+  };
+
+  rec.recorder.onstop = () => {
+    const mime = rec.recorder.mimeType || 'video/webm';
+    const blob = new Blob(rec.chunks, { type: mime });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `quadtych_rec_${Date.now()}.webm`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    rec.recorder = null;
+    rec.stream = null;
+    rec.chunks = [];
+  };
+
+  rec.recorder.start(250); // 250ms-onként dob chunkot
+  rec.active = true;
+  rec.startedAt = millis();
+  console.log("REC START");
+}
+
+function stopRecording() {
+  if (!rec.active) return;
+  rec.active = false;
+
+  try {
+    if (rec.recorder && rec.recorder.state !== 'inactive') {
+      rec.recorder.stop();
+    }
+  } catch (e) {
+    console.warn("Recorder stop error:", e);
+  }
+
+  console.log("REC STOP");
+}
+
+
+function drawKeypointsOverlaySoft(x,y,w,h){
+  if (!keypoints || keypoints.length===0) return;
+  const lim = min(keypoints.length, 220);
+  for (let i=0;i<lim;i++){
+    const k = keypoints[i];
+    const px = map(k.x,0,camW,x,x+w);
+    const py = map(k.y,0,camH,y,y+h);
+    const rr = map(constrain(k.response,0,0.06), 0,0.06, 2,9);
+    noFill();
+    stroke(255, 210, 120, 110);
+    strokeWeight(1);
+    ellipse(px,py, rr, rr);
+  }
+}
+
+// KÉK edge pontok (0,0,250)
+function drawEdgesDotsBlue(x,y,w,h){
+  if (!edgePts || edgePts.length===0) return;
+  const n = min(edgePts.length, 2400);
+  stroke(0,0,250, 150);
+  strokeWeight(1);
+  for (let i=0;i<n;i+=2){
+    const p = edgePts[i];
+    const px = map(p.x,0,camW,x,x+w);
+    const py = map(p.y,0,camH,y,y+h);
+    point(px,py);
+  }
+}
+
+// FEHÉR COCO bbox + label + bar (változatlan)
+function drawDetectionsOverlayWhite(x,y,w,h){
+  if (!detections || detections.length===0) return;
+  for (let i=0;i<detections.length;i++){
+    const d = detections[i];
+    const conf = constrain(d.confidence ?? d.score ?? 0, 0, 1);
+
+    const bx = map(d.x,0,camW,x,x+w);
+    const by = map(d.y,0,camH,y,y+h);
+    const bw = map(d.width,0,camW,0,w);
+    const bh = map(d.height,0,camH,0,h);
+
+    const cx = bx + bw*0.5;
+    const cy = by + bh*0.5;
+
+    // white outline
+    stroke(255, 240);
+    strokeWeight(2.2);
+    noFill();
+    rect(bx,by,bw,bh);
+
+    // crosshair (változatlan)
+    stroke(255, 140);
+    strokeWeight(1.1);
+    line(cx-18, cy, cx+18, cy);
+    line(cx, cy-18, cx, cy+18);
+
+    // label background
+    noStroke();
+    fill(0, 185);
+    rect(bx, by-22, min(340, textWidth(d.label)+92), 18, 6);
+
+    // label text (white)
+    fill(255);
+    textSize(12);
+    const cPct = Math.round(conf*100);
+    text(`#${i} ${d.label} ${cPct}%`, bx+8, by-9);
+
+    // confidence bar (white)
+    fill(255, 60);
+    rect(bx, by+bh+6, bw, 4, 2);
+    fill(255, 190);
+    rect(bx, by+bh+6, bw*conf, 4, 2);
+  }
+}
+
+/* ================== Panel3 helpers ================== */
+function drawSoftGrid(w,h){
+  // kevésbé zajos, finom grid
+  stroke(255, 10);
+  strokeWeight(1);
+
+  // ritkább vert/horiz
+  const step = 48;
+  for (let x=0; x<=w; x+=step) line(x, 0, x, h);
+  for (let y=0; y<=h; y+=step) line(0, y, w, y);
+
+  // “subgrid” nagyon finoman
+  stroke(255, 6);
+  const step2 = 24;
+  for (let x=0; x<=w; x+=step2) if (x%step!==0) line(x, 0, x, h);
+  for (let y=0; y<=h; y+=step2) if (y%step!==0) line(0, y, w, y);
+}
+
+function seedParticles(w,h){
+  // méret arány: edgeDensity + keypoint response + detection confidence
+  // keypoints
+  const kN = min(keypoints.length, 200);
+  for (let i=0;i<kN;i+=6){
+    const k = keypoints[i];
+    const px = map(k.x,0,camW,0,w);
+    const py = map(k.y,0,camH,0,h);
+    const w0 = constrain(map(k.response, 0, 0.06, 0.2, 1.4), 0.2, 1.4);
+    spawn(px,py, 0.18, 0.18, 220 + floor(w0*240), w0);
+  }
+
+  // object centers
+  for (const d of detections){
+    const conf = constrain(d.confidence ?? d.score ?? 0.6, 0, 1);
+    const cx = d.x + d.width*0.5;
+    const cy = d.y + d.height*0.5;
+    const px = map(cx,0,camW,0,w);
+    const py = map(cy,0,camH,0,h);
+    const w0 = 0.9 + conf*1.2;
+    spawn(px,py, 0.50, 0.50, 360 + floor(conf*240), w0);
+  }
+
+  // edges (kevesebb, hogy ne legyen zajos)
+  const eN = min(edgePts.length, 900);
+  for (let i=0;i<eN;i+=14){
+    const p = edgePts[i];
+    const px = map(p.x,0,camW,0,w);
+    const py = map(p.y,0,camH,0,h);
+    const w0 = 0.35 + edgeDensity*0.6;
+    spawn(px,py, 0.14, 0.14, 180 + floor(edgeDensity*220), w0);
+  }
+
+  if (particles.length > MAX_PARTICLES) {
+    particles.splice(0, particles.length - MAX_PARTICLES);
+  }
+}
+
+function spawn(x,y,vscale,jitter,life,w0){
+  const vx = (random(-1,1)*vscale) + random(-jitter,jitter);
+  const vy = (random(-1,1)*vscale) + random(-jitter,jitter);
+  particles.push(new Particle(x,y,vx,vy,life,w0));
+}
+
+/* ================== Panel4: machine log ================== */
+function appendMachineLogLine(){
+  const sig = signatureFromLum(lumFieldSm);
+  const detTok = compactDetTokens(detections, 3);
+
+  // keypoint energy
+  let kpE = 0;
+  for (let i=0;i<min(keypoints.length, 180);i++){
+    kpE += constrain(keypoints[i].response, 0, 0.08);
+  }
+  kpE = constrain(kpE / 3.0, 0, 1);
+
+  const t = nf(millis()/1000, 0, 2);
+  const line =
+    `t=${t} Lμ=${avgBrightness.toFixed(3)} Eρ=${edgeDensity.toFixed(3)} ` +
+    `KP=${toHex2(min(255,keypoints.length))} KE=${toHex2(floor(kpE*255))} ` +
+    `OBJ=${toHex2(min(255,detections.length))} TOK=${detTok} SIG=${sig}`;
+
+  logLines.push(line);
+  if (logLines.length > LOG_MAX) logLines.shift();
+}
+
+function flushMachineLog(){
+  const atBottom = (logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 18);
+
+  const header =
+`MACHINE STREAM / COPYABLE
+panel4 := feature-tokens derived from the same camera frame as panels 1–3
+---------------------------------------------------------------\n`;
+
+  logEl.value = header + logLines.join("\n");
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ================== Helpers: COCO tokens + signature ================== */
+function summarizeDetections(dets, topN=4){
+  if (!dets || dets.length===0) return "";
+  const sorted = [...dets].sort((a,b)=>(b.confidence??b.score??0)-(a.confidence??a.score??0));
+  return sorted.slice(0,topN).map(d=>{
+    const c = Math.round(((d.confidence??d.score??0)*100));
+    return `${d.label}(${c}%)`;
+  }).join("  ");
+}
+
+function shortToken(label){
+  const s = (label||"x").toLowerCase().replace(/[^a-z0-9]/g,"");
+  return (s.slice(0,3) || "x");
+}
+
+function compactDetTokens(dets, topN=3){
+  if (!dets || dets.length===0) return "∅";
+  const sorted = [...dets].sort((a,b)=>(b.confidence??b.score??0)-(a.confidence??a.score??0));
+  return sorted.slice(0,topN).map(d=>{
+    const conf = Math.floor((d.confidence ?? d.score ?? 0) * 255);
+    const cx = Math.floor(((d.x + d.width*0.5)/camW) * 255);
+    const cy = Math.floor(((d.y + d.height*0.5)/camH) * 255);
+    return `${shortToken(d.label)}${toHex2(conf)}${toHex2(cx)}${toHex2(cy)}`;
+  }).join("|");
+}
+
+function toHex2(v){
+  const h = (v & 255).toString(16);
+  return h.length===1 ? "0"+h : h;
+}
+
+function signatureFromLum(field){
+  let hash = 0x811c9dc5; // FNV-1a
+  for (let r=0;r<gridRows;r+=2){
+    for (let c=0;c<gridCols;c+=2){
+      const q = ((field[r][c]*255)|0) & 255;
+      hash ^= q;
+      hash = (hash * 0x01000193) >>> 0;
+    }
+  }
+  return ("00000000"+hash.toString(16)).slice(-8);
+}
+
+/* ================== Panel1: cover crop ================== */
+function drawImageCover(img, x, y, w, h) {
+  const srcW = img.width, srcH = img.height;
+  const srcAR = srcW / srcH;
+  const dstAR = w / h;
+
+  let sx, sy, sw, sh;
+  if (srcAR > dstAR) {
+    sh = srcH;
+    sw = sh * dstAR;
+    sx = (srcW - sw) / 2;
+    sy = 0;
+  } else {
+    sw = srcW;
+    sh = sw / dstAR;
+    sx = 0;
+    sy = (srcH - sh) / 2;
+  }
+  image(img, x, y, w, h, sx, sy, sw, sh);
+}
+
+/* ================== Mentés ================== */
+function keyPressed() {
+  if (key === 's' || key === 'S') saveCanvas('quadtych_' + Date.now(), 'png');
+  if (key === '1') { const img = get(0, 0, P, P); img.save('panel1_' + Date.now(), 'png'); }
+  if (key === '2') { const img = get(P, 0, P, P); img.save('panel2_' + Date.now(), 'png'); }
+  if (key === '3') { const img = get(0, P, P, P); img.save('panel3_' + Date.now(), 'png'); }
+  if (key === 'r' || key === 'R') {
+    if (!rec.active) startRecording();
+    else stopRecording();
+  }
+
+}
+
+</script>
+</body>
+</html>
